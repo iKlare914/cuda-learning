@@ -1,0 +1,8 @@
+/build/
+/CMakeUserPresets.json
+*.o
+*.out
+/.vscode/
+/.venv/
+__pycache__/
+*.py[cod]
