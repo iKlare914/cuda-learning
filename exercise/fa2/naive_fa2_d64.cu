@@ -1,5 +1,16 @@
 #include <utils.hpp>
 #include <math_constants.h>
+#include <type_traits>
+
+template<int N>
+struct VecLSTraits {
+    static_assert(N > 0);
+    static constexpr int WIDTH = 
+        N % 4 == 0 ? 4 : 
+        N % 2 == 0 ? 2 : 1;
+    using Type = std::conditional_t<WIDTH == 4, float4, 
+        std::conditional_t<WIDTH == 2, float2, float>>;
+};
 
 template<int BR_, int BC_, int HEADDIM_, int NWARPS_, int TCOARSE_A_, int TCOARSE_B_, bool RETURNLSU_>
 struct KernelTraits {
@@ -11,15 +22,19 @@ struct KernelTraits {
     static constexpr int TCOARSE_A = TCOARSE_A_; // thread coarse when computing Q @ K.T and computing rowmax in S matrix
     static constexpr int TCOARSE_B = TCOARSE_B_; // thread coarse when computing Q @ K.T and computing rowmax in S matrix
     static constexpr bool RETURNLSU = RETURNLSU_;
-    static_assert(TCOARSE_A_ % 4 == 0);
-    static_assert(TCOARSE_B_ % 4 == 0);
-    static_assert(BR_ % 4 == 0);
-    static_assert(BC_ % 4 == 0);
-    static_assert(HEADDIM_ % 4 == 0);
-    static_assert(BR % TCOARSE_A == 0);
-    static_assert(BC % TCOARSE_B == 0);
+    // static_assert(TCOARSE_A_ % 4 == 0);
+    // static_assert(TCOARSE_B_ % 4 == 0);
+    static_assert(BR_ % TCOARSE_A_ == 0);
+    static_assert(BC_ % TCOARSE_B_ == 0);
+    static_assert(HEADDIM_ % TCOARSE_B_ == 0);
     static_assert(NTHREADS == (BR / TCOARSE_A_)
                  * (BC / TCOARSE_B_));
+    using VecLSA = typename VecLSTraits<TCOARSE_A_>::Type;
+    using VecLSB = typename VecLSTraits<TCOARSE_B_>::Type;
+    using VecLSHD = typename VecLSTraits<HEADDIM_>::Type;
+    static constexpr int WIDTH_A = VecLSTraits<TCOARSE_A_>::WIDTH;
+    static constexpr int WIDTH_B = VecLSTraits<TCOARSE_B_>::WIDTH;
+    static constexpr int WIDTH_HD = VecLSTraits<HEADDIM_>::WIDTH;
 };
 
 void dataGen(std::vector<float> &vec, int n) {
@@ -28,16 +43,15 @@ void dataGen(std::vector<float> &vec, int n) {
     }
 }
 
-template<int M, int N, int NT>
-__device__ __forceinline__ void tile_load_float4(float* __restrict__ dst, const float* __restrict__ src, int tid, size_t src_offset, int n) {
+template<int M, int N, int NT, typename T, int WIDTH>
+__device__ __forceinline__ void tile_load_vectorized(float* __restrict__ dst, const float* __restrict__ src, int tid, size_t src_offset, int n) {
     // n dimension 1 in [m, n]
-    static_assert(N > 4);
-    static_assert(N % 4 == 0);
-    for(int q = tid; q < (M * N) / 4; q += NT) {
-        int r = q / (N / 4);
-        int c = (q % (N / 4)) * 4;
+    static_assert(N % WIDTH == 0);
+    for(int q = tid; q < (M * N) / WIDTH; q += NT) {
+        int r = q / (N / WIDTH);
+        int c = (q % (N / WIDTH)) * WIDTH;
         size_t offset = src_offset + r * n + c;
-        *reinterpret_cast<float4*>(dst + r * N + c) = *reinterpret_cast<const float4*>(src + offset);
+        *reinterpret_cast<T*>(dst + r * N + c) = *reinterpret_cast<const T*>(src + offset);
     }
 }
 
@@ -61,10 +75,13 @@ __device__ __forceinline__ float reduce_sum(float x) {
     return x;
 }
 
-// BR, BC, HEADDIM must be divisible by 4
 template<typename KTrait>
 __global__ void flash_attn(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ o, float* __restrict__ LSU, int L, int D) {
     constexpr const int BR = KTrait::BR, BC = KTrait::BC, HD = KTrait::HEADDIM, NT = KTrait::NTHREADS;
+    constexpr const int WIDTH_A = KTrait::WIDTH_A, WIDTH_B = KTrait::WIDTH_B, WIDTH_HD = KTrait::WIDTH_HD;
+    using VecLSA = KTrait::VecLSA;
+    using VecLSB = KTrait::VecLSB;
+    using VecLSHD = KTrait::VecLSHD;
     __shared__ __align__(16) float q_tile[BR][HD];
     __shared__ __align__(16) float k_tile[BC][HD]; // transpose layout, Since Q @ K.T
     __shared__ __align__(16) float v_tile[BC][HD];
@@ -81,7 +98,7 @@ __global__ void flash_attn(const float* __restrict__ q, const float* __restrict_
         int q_row = (q_block_idx * q_end + i) * BR;
         if(q_row >= L) break;
         size_t g_tile_offset_q = (size_t)(L) * D * batch + (size_t)(head) * L * HD + (size_t)(q_row) * HD; // Q tile offset in global Q [B, H, L, HD]
-        tile_load_float4<BR, HD, NT>(&q_tile[0][0], q, tid, g_tile_offset_q, HD); // load Q tile
+        tile_load_vectorized<BR, HD, NT, VecLSHD, WIDTH_HD>(&q_tile[0][0], q, tid, g_tile_offset_q, HD); // load Q tile
         float m[KTrait::TCOARSE_A], m_old[KTrait::TCOARSE_A];
         float l[KTrait::TCOARSE_A] = {0}; 
         #pragma unroll
@@ -89,8 +106,12 @@ __global__ void flash_attn(const float* __restrict__ q, const float* __restrict_
             m[_t] = -CUDART_INF_F;
         }
         constexpr int oThreadPerRow = BC / KTrait::TCOARSE_B;
+        static_assert(HD % oThreadPerRow == 0);
         constexpr int oOutputColPerThread = HD / oThreadPerRow;
-        static_assert(oOutputColPerThread % 4 == 0);
+        constexpr int WIDTH_O = oOutputColPerThread % 4 == 0 ? 4 : 
+            oOutputColPerThread % 2 == 0 ? 2 : 1;
+        using VecLSO = std::conditional_t<WIDTH_O == 4, float4,
+            std::conditional_t<WIDTH_O == 2, float2, float>>;
         float acc_o[KTrait::TCOARSE_A][oOutputColPerThread] = {};
         int o_tc_base = (tid % oThreadPerRow) * oOutputColPerThread;
 
@@ -98,8 +119,8 @@ __global__ void flash_attn(const float* __restrict__ q, const float* __restrict_
         for(int j = 0; j < cdiv_device(L, BC); ++j){
             float acc[KTrait::TCOARSE_A][KTrait::TCOARSE_B] = {};
             size_t g_tile_offset_kv = (size_t)(L) * D * batch + (size_t)(head) * L * HD + (size_t)(BC) * j * HD; // KV tile offset in global KV [B, H, L, HD]
-            tile_load_float4<BC, HD, NT>(&k_tile[0][0], k, tid, g_tile_offset_kv, HD);
-            tile_load_float4<BC, HD, NT>(&v_tile[0][0], v, tid, g_tile_offset_kv, HD);
+            tile_load_vectorized<BC, HD, NT, VecLSHD, WIDTH_HD>(&k_tile[0][0], k, tid, g_tile_offset_kv, HD);
+            tile_load_vectorized<BC, HD, NT, VecLSHD, WIDTH_HD>(&v_tile[0][0], v, tid, g_tile_offset_kv, HD);
             __syncthreads();
             // compute S = Q @ K.T [BR, BC]
             #pragma unroll
@@ -138,13 +159,17 @@ __global__ void flash_attn(const float* __restrict__ q, const float* __restrict_
             #pragma unroll
             for(int ii = 0; ii < KTrait::TCOARSE_A; ++ii) {
                 #pragma unroll
-                for(int jj = 0; jj < KTrait::TCOARSE_B; jj += 4) {
+                for(int jj = 0; jj < KTrait::TCOARSE_B; jj += WIDTH_B) {
                     // S is not needed !!!
                     // *reinterpret_cast<float4*>(&p_tile[tr_base + ii][tc_base + jj]) = make_float4(acc[ii][jj], acc[ii][jj + 1], acc[ii][jj + 2], acc[ii][jj + 3]);
-                    m[ii] = fmaxf(m[ii], acc[ii][jj]);
-                    m[ii] = fmaxf(m[ii], acc[ii][jj + 1]);
-                    m[ii] = fmaxf(m[ii], acc[ii][jj + 2]);
-                    m[ii] = fmaxf(m[ii], acc[ii][jj + 3]);
+                    // m[ii] = fmaxf(m[ii], acc[ii][jj]);
+                    // m[ii] = fmaxf(m[ii], acc[ii][jj + 1]);
+                    // m[ii] = fmaxf(m[ii], acc[ii][jj + 2]);
+                    // m[ii] = fmaxf(m[ii], acc[ii][jj + 3]);
+                    #pragma unroll
+                    for(int kk = 0; kk < WIDTH_B; ++kk) {
+                        m[ii] = fmaxf(m[ii], acc[ii][jj + kk]);
+                    }
                 }
             }
             // __syncthreads();
@@ -160,12 +185,24 @@ __global__ void flash_attn(const float* __restrict__ q, const float* __restrict_
             #pragma unroll
             for(int ii = 0; ii < KTrait::TCOARSE_A; ++ii) {
                 #pragma unroll
-                for(int jj = 0; jj < KTrait::TCOARSE_B; jj += 4){
-                    acc[ii][jj] = expf(acc[ii][jj] - m[ii]);
-                    acc[ii][jj + 1] = expf(acc[ii][jj + 1] - m[ii]);
-                    acc[ii][jj + 2] = expf(acc[ii][jj + 2] - m[ii]);
-                    acc[ii][jj + 3] = expf(acc[ii][jj + 3] - m[ii]);
-                    *reinterpret_cast<float4*>(&p_tile[tr_base + ii][tc_base + jj]) = make_float4(acc[ii][jj], acc[ii][jj + 1], acc[ii][jj + 2], acc[ii][jj + 3]);
+                for(int jj = 0; jj < KTrait::TCOARSE_B; jj += WIDTH_B){
+                    // acc[ii][jj] = expf(acc[ii][jj] - m[ii]);
+                    // acc[ii][jj + 1] = expf(acc[ii][jj + 1] - m[ii]);
+                    // acc[ii][jj + 2] = expf(acc[ii][jj + 2] - m[ii]);
+                    // acc[ii][jj + 3] = expf(acc[ii][jj + 3] - m[ii]);
+                    #pragma unroll
+                    for(int kk = 0; kk < WIDTH_B; ++kk) {
+                        acc[ii][jj + kk] = expf(acc[ii][jj + kk] - m[ii]);
+                    }
+                    if constexpr (std::is_same_v<float4, VecLSB>) {
+                        *reinterpret_cast<float4*>(&p_tile[tr_base + ii][tc_base + jj]) = make_float4(acc[ii][jj], acc[ii][jj + 1], acc[ii][jj + 2], acc[ii][jj + 3]);
+                    }
+                    if constexpr (std::is_same_v<float2, VecLSB>) {
+                        *reinterpret_cast<float2*>(&p_tile[tr_base + ii][tc_base + jj]) = make_float2(acc[ii][jj], acc[ii][jj + 1]);
+                    }
+                    if constexpr (std::is_same_v<float, VecLSB>) {
+                        p_tile[tr_base + ii][tc_base + jj] = acc[ii][jj];
+                    }
                 }
             }
             __syncthreads(); // Now S tile becomes P tile
@@ -199,13 +236,23 @@ __global__ void flash_attn(const float* __restrict__ q, const float* __restrict_
                     reg_p[ii] = p_tile[tr_base + ii][kk];
                 }
                 #pragma unroll
-                for(int ii = 0; ii < oOutputColPerThread; ii += 4) {
+                for(int ii = 0; ii < oOutputColPerThread; ii += WIDTH_O) {
                     int offset = kk * HD + o_tc_base + ii;
-                    float4 v_read = *reinterpret_cast<float4*>(&v_tile[0][0] + offset);
-                    reg_v[ii] = v_read.x;
-                    reg_v[ii + 1] = v_read.y;
-                    reg_v[ii + 2] = v_read.z;
-                    reg_v[ii + 3] = v_read.w;
+                    if constexpr (std::is_same_v<VecLSO, float4>) {
+                        float4 v_read = *reinterpret_cast<float4*>(&v_tile[0][0] + offset);
+                        reg_v[ii] = v_read.x;
+                        reg_v[ii + 1] = v_read.y;
+                        reg_v[ii + 2] = v_read.z;
+                        reg_v[ii + 3] = v_read.w;
+                    }
+                    if constexpr (std::is_same_v<VecLSO, float2>) {
+                        float2 v_read = *reinterpret_cast<float2*>(&v_tile[0][0] + offset);
+                        reg_v[ii] = v_read.x;
+                        reg_v[ii + 1] = v_read.y;
+                    }
+                    if constexpr (std::is_same_v<VecLSO, float>) {
+                        reg_v[ii] = *(&v_tile[0][0] + offset);
+                    }
                 }
                 #pragma unroll
                 for(int ii = 0; ii < KTrait::TCOARSE_A; ++ii) {
@@ -231,9 +278,17 @@ __global__ void flash_attn(const float* __restrict__ q, const float* __restrict_
         #pragma unroll
         for(int ii = 0; ii < KTrait::TCOARSE_A; ++ii) {
             #pragma unroll
-            for(int jj = 0; jj < oOutputColPerThread; jj += 4) {
+            for(int jj = 0; jj < oOutputColPerThread; jj += WIDTH_O) {
                 size_t offset = g_tile_offset_q + (size_t)(tr_base + ii) * HD + (size_t)(o_tc_base + jj);
-                *reinterpret_cast<float4*>(o + offset) = make_float4(acc_o[ii][jj], acc_o[ii][jj + 1], acc_o[ii][jj + 2], acc_o[ii][jj + 3]);
+                if constexpr (std::is_same_v<VecLSO, float4>) {
+                    *reinterpret_cast<float4*>(o + offset) = make_float4(acc_o[ii][jj], acc_o[ii][jj + 1], acc_o[ii][jj + 2], acc_o[ii][jj + 3]);
+                }
+                if constexpr (std::is_same_v<VecLSO, float2>) {
+                    *reinterpret_cast<float2*>(o + offset) = make_float2(acc_o[ii][jj], acc_o[ii][jj + 1]);
+                }
+                if constexpr (std::is_same_v<VecLSO, float>) {
+                    o[offset] = acc_o[ii][jj];
+                }
             }
         }
 
