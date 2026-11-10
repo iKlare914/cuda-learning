@@ -1,4 +1,5 @@
 #include <utils.hpp>
+#include "cpu_attention.hpp"
 #include <math_constants.h>
 #include <type_traits>
 
@@ -312,14 +313,21 @@ int main(int argc, char* argvs[]) {
     std::srand(42);
     printDeviceProps();
     // QKV [B, H, L, HD]
-    constexpr const int B = 1, L = 4096, HD = 64, H = 8;
+    constexpr const int B = 1, HD = 64, H = 8;
+    const bool test_cpu = argc > 2 && !std::strcmp(argvs[2], "cpu");
+    const int L = argc > 3 ? std::atoi(argvs[3]) : 4096;
+    const int repeats = argc > 1 ? std::atoi(argvs[1]) : 10;
+    if (L <= 0 || L % 32 != 0 || repeats <= 0) {
+        std::fprintf(stderr, "Usage: %s [positive repeats] [cpu|gpu] [L: positive multiple of 32]\n", argvs[0]);
+        return EXIT_FAILURE;
+    }
     size_t numel = (size_t)(B) * L * HD * H;
     size_t bytes = (size_t)(B) * L * HD * H * sizeof(float);
     std::vector<float> q(numel, 0), k(numel, 0), v(numel, 0), o(numel, 0), res(numel, 0), lsu(numel / HD, 0), res_lsu(numel / HD, 0);
     float *device_q, *device_k, *device_v, *device_o, *device_lsu;
     dataGen(q, numel); 
     dataGen(k, numel); 
-    dataGen(v, numel); 
+    dataGen(v, numel);
 
     CUDA_CHECK(cudaMalloc(&device_q, bytes));
     CUDA_CHECK(cudaMalloc(&device_k, bytes));
@@ -341,7 +349,10 @@ int main(int argc, char* argvs[]) {
                 Case1Trait::NWARPS, Case1Trait::NTHREADS,
                 Case1Trait::TCOARSE_A, Case1Trait::TCOARSE_B,
                 Case1Trait::RETURNLSU ? "true" : "false");
-    std::cin >> case_;
+    if (!(std::cin >> case_) || case_ != 1) {
+        std::fprintf(stderr, "Only kernel trait case 1 is implemented\n");
+        return EXIT_FAILURE;
+    }
     auto launch_kernel = [&](){
         switch (case_)
         {
@@ -357,9 +368,9 @@ int main(int argc, char* argvs[]) {
         default:
             break;
         }
+        CUDA_CHECK(cudaGetLastError());
     };
     
-    const int repeats = argc > 1 ? std::atoi(argvs[1]) : 10;
     const auto [gpu_total_ms, gpu_avg_ms] = kernelTimer(launch_kernel, repeats);
 
     CUDA_CHECK(cudaMemcpy(res.data(), device_o, bytes, cudaMemcpyDeviceToHost));
@@ -369,5 +380,20 @@ int main(int argc, char* argvs[]) {
     CUDA_CHECK(cudaFree(device_v));
     CUDA_CHECK(cudaFree(device_o));
     CUDA_CHECK(cudaFree(device_lsu));
-    return 0;
+    if (test_cpu) {
+        std::vector<float> cpu_o, cpu_lsu;
+        const auto cpu_start = std::chrono::steady_clock::now();
+        attention_cpu(q, k, v, cpu_o, cpu_lsu, B, H, L, HD);
+        const auto cpu_stop = std::chrono::steady_clock::now();
+        const double cpu_ms =
+            std::chrono::duration<double, std::milli>(cpu_stop - cpu_start).count();
+        std::printf("CPU attention: %.3f ms (includes result allocation)\n", cpu_ms);
+        if (gpu_avg_ms > 0.0) {
+            std::printf("CPU time / GPU kernel time: %.2fx\n", cpu_ms / gpu_avg_ms);
+        }
+        const bool o_ok = check_attention("O", res, cpu_o, H, L, HD);
+        const bool lsu_ok = check_attention("LSU", res_lsu, cpu_lsu, H, L, 1);
+        if (!o_ok || !lsu_ok) return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
 }
