@@ -9,7 +9,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # ARGN contains all source files supplied after the target name.
 function(add_learning_executable target)
-    add_executable(${target} ${ARGN} "${PROJECT_SOURCE_DIR}/include/utils.cpp")
+    add_executable(${target} ${ARGN} "${PROJECT_SOURCE_DIR}/include/utils.cpp") 
     target_compile_options(${target} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-Wall>
         $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
@@ -19,7 +19,7 @@ function(add_learning_executable target)
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-lineinfo>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-Xptxas=-v,-warn-spills> # warning of register spill
     )
-    target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/include")
     target_link_libraries(${target} PRIVATE CUDA::cudart_static) # link static runtime libaray so that cpp files can use cuda runtime api functions
 endfunction()
 
@@ -45,6 +45,7 @@ if(ENABLE_CUDA)
     add_learning_executable(tiled_coarsed_reduce_sum gpu-mode/lecture9/tiled_coarsed_reduce_sum.cu)
     add_learning_executable(warp_reduce_sum gpu-mode/lecture9/warp_reduce_sum.cu)
     add_learning_executable(coarsed_warp_reduce_sum gpu-mode/lecture9/coarsed_warp_reduce_sum.cu)
-    add_learning_executable(naive_fa2_d64 exercise/fa2/naive_fa2_d64.cu)
-    add_learning_executable(kv_tile_reuse_fa2_d64 exercise/fa2/kv_tile_reuse_fa2_d64.cu)
+    add_learning_executable(naive_fa2_d64 exercise/cuda/fa2/naive_fa2_d64.cu)
+    add_learning_executable(kv_tile_reuse_fa2_d64 exercise/cuda/fa2/kv_tile_reuse_fa2_d64.cu)
+    add_learning_executable(cute_layout_test exercise/cute/layout_test.cu)
 endif()
