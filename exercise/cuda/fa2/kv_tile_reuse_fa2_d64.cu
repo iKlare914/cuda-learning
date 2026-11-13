@@ -314,7 +314,7 @@ int main(int argc, char* argvs[]) {
     std::srand(42);
     printDeviceProps();
     // QKV [B, H, L, HD]
-    constexpr const int B = 1, HD = 128, H = 12;
+    constexpr const int B = 1, HD = 64, H = 12;
     const bool test_cpu = argc > 2 && !std::strcmp(argvs[2], "cpu");
     const int L = argc > 3 ? std::atoi(argvs[3]) : 4096;
     const int repeats = argc > 1 ? std::atoi(argvs[1]) : 10;
